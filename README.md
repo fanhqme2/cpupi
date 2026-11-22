@@ -26,15 +26,15 @@ The timer covers worker startup, arithmetic and decimal formatting. It stops bef
 
 ## Performance
 
-Measured on an AMD Ryzen 9 9950X3D with 16 cores, 32 threads and 124 GiB of RAM under Linux/WSL2. CpuPi used GCC 11.4 and 32 workers. The table gives the median computation time and the highest peak resident memory (RSS) across three runs per size. The y-cruncher column gives the median from an earlier three-run comparison on the same machine using Komari 0.8.7.9547. All CpuPi runs were checked against the SHA-256 of the full y-cruncher decimal output.
+Measured on an AMD Ryzen 9 9950X3D with 16 cores, 32 threads and 124 GiB of RAM under Linux/WSL2. CpuPi used GCC 11.4 and 32 workers. CpuPi times are three-run medians for 1B–3B and individual runs for 4B and 5B. Peak resident memory (RSS) is the maximum from the three-run sweep at each size. The y-cruncher column gives the median from an earlier three-run comparison on the same machine using Komari 0.8.7.9547. All CpuPi runs were checked against the SHA-256 of the full y-cruncher decimal output.
 
 | Fractional digits | CpuPi compute (s) | CpuPi peak RSS (GiB) | y-cruncher compute (s) |
 |---:|---:|---:|---:|
 | 1 billion | 14.33 | 7.76 | 15.76 |
 | 2 billion | 31.54 | 14.90 | 33.85 |
 | 3 billion | 51.07 | 23.51 | 53.95 |
-| 4 billion | 71.21 | 29.91 | 74.61 |
-| 5 billion | 94.53 | 36.20 | 96.76 |
+| 4 billion | 70.49 | 29.91 | 74.61 |
+| 5 billion | 90.19 | 36.20 | 96.76 |
 
 [Per-run measurements and SHA-256 digests](benchmarks/ryzen9950x3d.csv)
 

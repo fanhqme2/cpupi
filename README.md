@@ -30,11 +30,11 @@ Measured on an AMD Ryzen 9 9950X3D with 16 cores, 32 threads and 124 GiB of RAM 
 
 | Fractional digits | CpuPi compute (s) | CpuPi peak RSS (GiB) | y-cruncher compute (s) |
 |---:|---:|---:|---:|
-| 1 billion | 14.87 | 7.82 | 15.76 |
-| 2 billion | 32.33 | 15.25 | 33.85 |
-| 3 billion | 51.60 | 23.29 | 53.95 |
-| 4 billion | 72.12 | 29.84 | 74.61 |
-| 5 billion | 92.88 | 38.16 | 96.76 |
+| 1 billion | 14.33 | 7.76 | 15.76 |
+| 2 billion | 31.54 | 14.90 | 33.85 |
+| 3 billion | 51.07 | 23.51 | 53.95 |
+| 4 billion | 71.21 | 29.91 | 74.61 |
+| 5 billion | 94.53 | 36.20 | 96.76 |
 
 [Per-run measurements and SHA-256 digests](benchmarks/ryzen9950x3d.csv)
 

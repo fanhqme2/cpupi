@@ -434,21 +434,24 @@ class SeriesFactors {
                 numerators.reserve(3 * (hi - lo));
             denominators.reserve(hi - lo);
             U count = hi - std::max<U>(lo, 1);
+            // Move P(k) to the preceding matrix. The product of earlier
+            // matrices then supplies P(k), leaving only L(k) in this T.
+            auto current = lo ? term_factors(lo) : TermFactors{};
             auto term = [&](LeafSum& out, U k) {
-                if (!k) {
-                    leaf_term(out, k);
-                    return;
-                }
-                auto f = term_factors(k);
+                const auto f = term_factors(k + 1);
+                const auto previous = current;
+                current = f;
                 if (need_p) {
                     numerators.push_back(f.a);
                     numerators.push_back(f.b);
                     numerators.push_back(f.c);
                 }
-                unsigned twos = std::countr_zero(f.d);
-                q.small[8] += twos;
-                denominators.push_back(f.d >> twos);
-                leaf_term_scaled(out, k, W(f.a) * f.b * f.c, f.d, f.correction);
+                if (k) {
+                    unsigned twos = std::countr_zero(previous.d);
+                    q.small[8] += twos;
+                    denominators.push_back(previous.d >> twos);
+                }
+                leaf_term_scaled<true>(out, k, W(f.a) * f.b * f.c, previous.d, previous.correction);
             };
             node.t = raw(lo, hi, false, false, term).t;
             if (need_p)
@@ -492,11 +495,12 @@ class SeriesFactors {
         // Prefix weight at lo is at most 10^(-14.18*(lo-1)). Retain the
         // corresponding precision in T; P and Q remain exact. Twelve
         // additional base words cover the linear factor, wheel correction,
-        // decimal shift rounding and error accumulation over the tree.
+        // decimal shift rounding and error accumulation over the tree. Four more
+        // cover the reindexed numerator, a product of three 32-bit factors.
         size_t sa = l.low + (3 * (hi - 1) + 7) / 8 - (3 * (mid - 1) + 7) / 8, sb = r.low;
         size_t highest = std::max(l.t.size() + q.size() + sa, r.t.size() + p.size() + sb);
         size_t saved = lo ? size_t((lo - 1) * 14.18L / 8) : 0;
-        size_t keep = precision - std::min(precision - 8, saved) + 12;
+        size_t keep = precision - std::min(precision - 8, saved) + 16;
         size_t low = std::max(std::min(sa, sb), highest - std::min(keep, highest));
         Nat a, b, prefix_q;
         // A prefix needs its numeric denominator at the root. Its left sum

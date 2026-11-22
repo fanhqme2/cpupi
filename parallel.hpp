@@ -13,6 +13,8 @@
 namespace ap {
 size_t available_memory_bytes();
 
+enum class CrtSchedule { standard, decimal };
+
 // Tasks own contiguous, disjoint ranges of worker slots. A worker can fork
 // recursively within its range without creating another OS thread.
 class Team {
@@ -25,6 +27,7 @@ class Team {
     };
     std::unique_ptr<Slot[]> slots;
     std::vector<std::thread> workers;
+    const CrtSchedule crt_schedule;
     static inline thread_local Team* current = nullptr;
     static inline thread_local size_t rank = 0;
     void worker(size_t id);
@@ -47,7 +50,10 @@ class Team {
     }
 
   public:
-    explicit Team(size_t n);
+    explicit Team(size_t n, CrtSchedule crt = CrtSchedule::decimal);
+    static bool use_decimal_crt() {
+        return !current || current->crt_schedule == CrtSchedule::decimal;
+    }
     ~Team();
     Team(const Team&) = delete;
     Team& operator=(const Team&) = delete;

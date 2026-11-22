@@ -337,7 +337,41 @@ struct CoefficientCarry {
         return _mm512_cvtepi64_epi32(r);
     }
 };
+// For short inputs accumulate alternate output diagonals in two sets of lanes.
+// A memory operand to vpmuludq selects every other input limb directly.
+Nat short_school(const Nat& a, const Nat& b) {
+    alignas(64) uint32_t padded[192]{};
+    constexpr unsigned margin = 64;
+    std::copy(a.begin(), a.end(), padded + margin);
+    Nat out = overwrite_limbs(a.size() + b.size());
+    CoefficientCarry carry;
+    const auto low = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+    const auto high = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+    for (size_t j = 0; j < out.size(); j += 16) {
+        __m512i even{}, odd{};
+        size_t first = j < a.size() ? 0 : j - a.size() + 1;
+        size_t end = std::min(j + 16, b.size());
+        for (size_t i = first; i < end; ++i) {
+            const auto* row = padded + margin + j - i;
+            auto w = _mm512_set1_epi32(b[i]);
+            even += _mm512_mul_epu32(w, _mm512_loadu_si512(row));
+            odd += _mm512_mul_epu32(w, _mm512_loadu_si512(row + 1));
+        }
+        auto store = [&](size_t pos, __m512i v) {
+            unsigned count = std::min<size_t>(8, out.size() - pos);
+            _mm256_mask_storeu_epi32(out.data() + pos, (1u << count) - 1, carry.take(v));
+        };
+        store(j, _mm512_permutex2var_epi64(even, low, odd));
+        if (j + 8 < out.size())
+            store(j + 8, _mm512_permutex2var_epi64(even, high, odd));
+    }
+    trim(out);
+    return out;
+}
+
 Nat school(const Nat& a, const Nat& b) {
+    if (a.size() >= 8 && a.size() <= 64 && b.size() <= a.size())
+        return short_school(a, b);
     if (b.size() <= 64 && a.size() >= 32) {
         Nat out = overwrite_limbs(a.size() + b.size());
         CoefficientCarry carry;
@@ -773,7 +807,7 @@ Nat tiled_product(const Nat& a, const Nat& b, int workers, size_t budget, size_t
     trim(result);
     return result;
 }
-template <int digits>
+template <int digits, U first_prime = prime0>
 Nat recover(Buffer& x, Buffer& z, Buffer& third, size_t used, size_t n, int workers,
             size_t period = 0) {
     constexpr bool crt = digits > 6;
@@ -785,12 +819,12 @@ Nat recover(Buffer& x, Buffer& z, Buffer& third, size_t used, size_t n, int work
                                        : 10000000000000000ULL;
     using F1 = Field<prime1>;
     using F2 = Field<prime2>;
-    static const U inv1 = F1::power(prime0 % prime1, prime1 - 2);
-    constexpr Wide first_two = Wide(prime0) * prime1;
+    static const U inv1 = F1::power(first_prime % prime1, prime1 - 2);
+    constexpr Wide first_two = Wide(first_prime) * prime1;
     static const U inv2 = F2::power(first_two % prime2, prime2 - 2);
     auto value = [&](size_t j) {
         if constexpr (crt)
-            return Wide(z.data[j]) * prime0 + x.data[j];
+            return Wide(z.data[j]) * first_prime + x.data[j];
         else
             return x.data[j];
     };
@@ -818,13 +852,18 @@ Nat recover(Buffer& x, Buffer& z, Buffer& third, size_t used, size_t n, int work
                 for (size_t k = 0; k < count; k += 8) {
                     size_t pos = first + k;
                     auto lo = F1::load(x.data + pos);
-                    auto diff = F1::load(z.data + pos) + F1::splat(prime1) - F1::reduce(lo);
+                    auto low_mod = first_prime < prime1 ? lo : F1::reduce(lo);
+                    auto diff = F1::load(z.data + pos) + F1::splat(prime1) - low_mod;
                     auto k1 = F1::reduce(F1::shoup(diff, w1, q1));
-                    if constexpr (digits == 12) {
-                        // Split k1*prime0 at the transform radix before carrying.
+                    if constexpr (digits == 12 && first_prime == 1536000000000001ULL) {
+                        // lo + k1*p = (lo + k1) + radix*(1536*k1).
+                        F1::save(x.data + pos, lo + k1);
+                        F1::save(z.data + pos, _mm512_slli_epi64(k1 + _mm512_slli_epi64(k1, 1), 9));
+                    } else if constexpr (digits == 12) {
+                        // Split k1*first_prime at the transform radix before carrying.
                         // The reciprocal underestimates k1*c/radix by less than one.
                         // The redundant remainder is below 2*radix and fits in 52 bits.
-                        constexpr U c = prime0 % radix;
+                        constexpr U c = first_prime % radix;
                         constexpr U reciprocal = (Wide(c) << 52) / radix;
                         auto q = F1::splat(reciprocal);
                         auto quotient = _mm512_madd52hi_epu64(_mm512_setzero_si512(), k1, q);
@@ -835,11 +874,11 @@ Nat recover(Buffer& x, Buffer& z, Buffer& third, size_t used, size_t n, int work
                             F1::splat(R - 1);
                         F1::save(x.data + pos, lo + remainder);
                         F1::save(z.data + pos,
-                                 quotient + _mm512_mullo_epi64(k1, F1::splat(prime0 / radix)));
+                                 quotient + _mm512_mullo_epi64(k1, F1::splat(first_prime / radix)));
                     } else
                         F1::save(z.data + pos, k1);
                     if constexpr (digits == 16) {
-                        constexpr U a = prime0 % prime2;
+                        constexpr U a = first_prime % prime2;
                         auto m = F2::shoup(k1, F2::splat(a), F2::splat((Wide(a) << 52) / prime2));
                         auto d = F2::load(third.data + pos) + F2::splat(2 * prime2) -
                                  F2::reduce(lo) - F2::reduce(m);
@@ -856,7 +895,7 @@ Nat recover(Buffer& x, Buffer& z, Buffer& third, size_t used, size_t n, int work
                 size_t pos = first + k, j = logical + k;
                 U digit;
                 if constexpr (digits == 12) {
-                    // prime0*prime1/radix is below 2^63, leaving room for the low part.
+                    // first_prime*prime1/radix is below 2^63, leaving room for the low part.
                     U v = U(carry) + x.data[pos];
                     digit = v % radix;
                     carry = z.data[pos] + v / radix;
@@ -1012,6 +1051,17 @@ Nat transform_product(const Nat& a, const Nat& b, int threads, size_t* requested
         return tiled_product(a, b, threads, reservation.tile_budget, discard);
     int workers = std::min<size_t>(threads, 1 + n / 16384);
     Buffer x(n), y(&a == &b ? 0 : n), z(crt ? n : 0), third(digits == 16 ? n : 0);
+    if constexpr (digits == 12) {
+        constexpr U decimal_prime = 1536000000000001ULL, max_digit = 999999999999ULL;
+        const size_t overlap = extent<12>(std::min(a.size(), b.size()));
+        if (Team::use_decimal_crt() && !requested && n <= (size_t(1) << 21) &&
+            overlap <= (Wide(decimal_prime) * prime1 - 1) / (Wide(max_digit) * max_digit)) {
+            residues<12, decimal_prime>(x.data, y.data, n, a, b, workers);
+            residues<12, prime1>(z.data, y.data, n, a, b, workers);
+            y.release();
+            return discard_low(recover<12, decimal_prime>(x, z, third, used, n, workers), discard);
+        }
+    }
     if constexpr (!crt) {
         constexpr U small_prime = 1125818302464001, max_digit = digits == 4   ? 9999
                                                                 : digits == 5 ? 99999

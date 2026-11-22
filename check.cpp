@@ -223,6 +223,15 @@ int main(int argc, char** argv) {
                 if (shared && (x != ap::mul(common, left, 16) || y != ap::mul(common, right, 16)))
                     throw std::runtime_error("wide shared digit columns disagree");
             }
+            // An all-nines guard can propagate a carry from a discarded
+            // inverse row. The exact retry must reproduce (B^m-1)(B^m+1).
+            {
+                constexpr size_t m = 2000000, cut = m / 2;
+                ap::Nat left(m, ap::base - 1), right(m + 1);
+                right.front() = right.back() = 1;
+                if (ap::mul_high(left, right, cut, 16) != ap::Nat(2 * m - cut, ap::base - 1))
+                    throw std::runtime_error("ambiguous high-product guard mismatch");
+            }
             // Verify an upper slice around the long carry chain in a wide CRT square.
             const size_t n = 16000000;
             ap::Nat nines(n, ap::base - 1);

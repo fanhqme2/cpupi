@@ -41,8 +41,9 @@ inline thread_local Scratch row_scratch;
 struct Layout {
     size_t cols;
     bool tiled;
-    explicit Layout(size_t n)
-        : cols(n < 16384 ? n : n >> std::min(13, std::countr_zero(n) / 2)), tiled(n >= (1u << 18)) {
+    explicit Layout(size_t n, bool prepared_columns = false)
+        : cols(n < 16384 ? n : n >> std::min(13, std::countr_zero(n) / 2)),
+          tiled(n >= (1u << 18) || (prepared_columns && n >= (1u << 16))) {
     }
     size_t index(size_t row, size_t col) const {
         return tiled ? (row / 16 * 16) * cols + (col / 32) * 512 + (row % 16) * 32 + col % 32
@@ -91,6 +92,10 @@ template <U p> struct Field {
                 r = product(r, a);
         return r;
     }
+    static constexpr bool decimal_prime = p == 1536000000000001ULL;
+    static constexpr U generator = decimal_prime ? 23 : 7;
+    static constexpr U mont_inverse = decimal_prime ? 1459069674061825ULL : R + 2 - p;
+    static_assert(((p * mont_inverse) & (R - 1)) == 1);
     using V = __m512i;
     static V splat(U n) {
         return _mm512_set1_epi64(n);
@@ -109,9 +114,9 @@ template <U p> struct Field {
         V zero = _mm512_setzero_si512();
         V lo = _mm512_madd52lo_epu64(zero, a, b);
         V hi = _mm512_madd52hi_epu64(zero, a, b);
-        // p = 1 mod 2^32, so (2-p)*p = 1 mod R. The low halves
+        // mont_inverse is the inverse of p modulo R. The low halves
         // of a*b and m*p match and their subtraction needs no borrow.
-        V m = _mm512_madd52lo_epu64(zero, lo, splat(R + 2 - p));
+        V m = _mm512_madd52lo_epu64(zero, lo, splat(mont_inverse));
         return hi + splat(p) - _mm512_madd52hi_epu64(zero, m, splat(p));
     }
     static V mont(V a, V b) { return reduce(mont_lazy(a, b)); }
@@ -137,7 +142,7 @@ template <U p> struct Field {
                 table.w.reserve(count + 8);
                 table.q.reserve(count + 8);
                 for (size_t k = 1; k < count; k *= 2) {
-                    U w = power(7, (p - 1) / (4 * k));
+                    U w = power(generator, (p - 1) / (4 * k));
                     if (inverse)
                         w = power(w, p - 2);
                     for (size_t i = 0; i < k; ++i) {
@@ -315,7 +320,7 @@ template <U p> struct Field {
     template <bool inverse, bool packed, class Reader>
     static void columns(U* data, size_t rows, size_t cols, size_t col, const Weights& tw,
                         size_t extent, U scale, U scale_q, Reader read, const Layout& layout,
-                        size_t width) {
+                        size_t width, bool compact = false, size_t skip_rows = 0) {
         auto& scratch = column_scratch;
         scratch.resize(rows * width);
         size_t first_step = 1;
@@ -368,8 +373,8 @@ template <U p> struct Field {
             }
         }
         levels<inverse>(scratch.data(), rows, rows / first_step, 1, width, tw);
-        bool streaming = !packed && rows * cols >= (1u << 23);
-        for (size_t i = 0; i < rows; ++i) {
+        bool streaming = !compact && !packed && rows * cols >= (1u << 21);
+        for (size_t i = inverse ? skip_rows : 0; i < rows; ++i) {
             size_t pos = layout.index(i, col);
             if constexpr (inverse)
                 if (i * cols + col >= extent)
@@ -378,6 +383,14 @@ template <U p> struct Field {
                 V v = load(scratch.data() + i * width + j);
                 if constexpr (inverse)
                     v = reduce(shoup(v, splat(scale), splat(scale_q)));
+                // Each worker owns all 512 words of each tile it compacts.
+                // Input was gathered before these overlapping stores begin.
+                if constexpr (inverse && !packed && have_packing) {
+                    if (compact) {
+                        save_packed(data + (pos & ~size_t(511)), (pos & 511) + j, v);
+                        continue;
+                    }
+                }
                 if constexpr (packed)
                     save_packed(data, pos + j, v);
                 else if (streaming)
@@ -398,7 +411,7 @@ template <U p> struct Field {
         Weights one, two;
         U root, quot;
         void init(size_t n, bool inverse) {
-            U gen = power(7, (p - 1) / n);
+            U gen = power(generator, (p - 1) / n);
             if (inverse)
                 gen = power(gen, p - 2);
             root = power(gen, n / 3);
@@ -422,7 +435,7 @@ template <U p> struct Field {
         std::array<U, 4> weights, reciprocals;
         void init(size_t cols, bool inverse) {
             const size_t n = cols / 5;
-            U gen = power(7, (p - 1) / cols);
+            U gen = power(generator, (p - 1) / cols);
             if (inverse)
                 gen = power(gen, p - 2);
             U w = power(gen, n), w2 = product(w, w), w3 = product(w, w2), w4 = product(w, w3);
@@ -485,7 +498,7 @@ template <U p> struct Field {
                     rev ^= bit;
                 }
             };
-            U root = power(7, (p - 1) / n);
+            U root = power(generator, (p - 1) / n);
             phases(f, root);
             phases(b, power(root, p - 2));
         }
@@ -601,12 +614,12 @@ template <U p> struct Field {
     }
     template <bool pair, bool packed = false, bool triple = false, class Reader>
     static void convolution(U* x, U* y, U* z, const Plan& plan, int workers, bool square, size_t nx,
-                            size_t ny, size_t nz, U scale, Reader read, bool columns_ready = false) {
+                            size_t ny, size_t nz, U scale, Reader read, bool columns_ready = false, bool compact = false, size_t skip = 0) {
         const size_t rows = plan.rows, cols = plan.cols;
         const auto& f = plan.table->f;
         const auto& b = plan.table->b;
         U scale_q = (Wide(scale) << 52) / p;
-        const Layout layout(rows * cols);
+        const Layout layout(rows * cols, columns_ready);
         auto do_row = [&](size_t i) {
             auto forward = [&](U* row) {
                 if (rows > 1)
@@ -713,12 +726,13 @@ template <U p> struct Field {
             });
         }
         blocks(rows, workers, do_row);
-        blocks(cols / width, workers, [&](size_t i) {
-            columns<true, packed>(x, rows, cols, i * width, b, nx + ny + (triple ? nx : 0), scale,
-                                  scale_q, reader(0), layout, width);
+        const size_t output_width = compact ? stripe : width;
+        blocks(cols / output_width, workers, [&](size_t i) {
+            columns<true, packed>(x, rows, cols, i * output_width, b, nx + ny + (triple ? nx : 0), scale,
+                                  scale_q, reader(0), layout, output_width, compact, skip / cols);
             if constexpr (pair)
-                columns<true, packed>(z, rows, cols, i * width, b, nz + ny, scale, scale_q,
-                                      reader(2), layout, width);
+                columns<true, packed>(z, rows, cols, i * output_width, b, nz + ny, scale, scale_q,
+                                      reader(2), layout, output_width, compact, skip / cols);
         });
     }
 };

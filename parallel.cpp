@@ -37,7 +37,7 @@ void Team::worker(size_t id) {
         s.state.notify_one();
     }
 }
-Team::Team(size_t n) : slots(std::make_unique<Slot[]>(n)) {
+Team::Team(size_t n, CrtSchedule crt) : slots(std::make_unique<Slot[]>(n)), crt_schedule(crt) {
     if (current || !n)
         throw std::logic_error("invalid worker team");
     try {

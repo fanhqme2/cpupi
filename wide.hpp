@@ -4,8 +4,18 @@ static constexpr U moduli[] = {2246998040248321, 2246482644172801, 2244743182417
                                2242939296153601, 2241070985379841, 2238429580492801,
                                2237463212851201, 2236561269719041, 2233468893265921};
 using CrtDigits = std::array<uint32_t, 18>;
+constexpr U crt_decimal = 1000000000000ULL;
+constexpr U chunk12(const CrtDigits& digits, size_t k) {
+    size_t i = 3 * (k / 2);
+    auto get = [&](size_t j) -> U { return j < digits.size() ? digits[j] : 0; };
+    return k % 2 ? get(i + 1) / 10000 + 10000 * get(i + 2)
+                 : get(i) + U(base) * (get(i + 1) % 10000);
+}
+struct DecimalWeight { U value, quotient; };
 struct CrtWeights {
     CrtDigits modulus{};
+    std::array<std::array<DecimalWeight, 9>, 12> decimal{};
+    std::array<U, 12> decimal_modulus{};
     std::array<CrtDigits, 9> cofactors{};
     std::array<U, 9> inverses{};
 };
@@ -38,6 +48,13 @@ constexpr CrtWeights make_crt_weights(size_t count) {
             v = Wide(v) * v % p;
         }
         table.inverses[i] = inv;
+    }
+    for (size_t k = 0; k < 12; ++k) {
+        table.decimal_modulus[k] = chunk12(table.modulus, k);
+        for (size_t i = 0; i < count; ++i) {
+            U w = chunk12(table.cofactors[i], k);
+            table.decimal[k][i] = {w, U((Wide(w) << 52) / crt_decimal)};
+        }
     }
     return table;
 }
@@ -110,7 +127,7 @@ void forward_columns(const Nat& input, std::array<std::unique_ptr<Buffer>, prime
                      size_t n, size_t words, int workers) {
     for (size_t i = begin; i < begin + field_count; ++i)
         planes[i] = std::make_unique<Buffer>(words);
-    const ntt::Layout layout(n);
+    const ntt::Layout layout(n, true);
     const size_t count = (input.size() + width - 1) / width;
     const size_t occupied = (count + layout.cols - 1) / layout.cols;
     const size_t stride = occupied * 8;
@@ -165,7 +182,7 @@ void forward_columns(const Nat& input, std::array<std::unique_ptr<Buffer>, prime
 template <size_t I, bool packed, bool pair, size_t width, bool triple = false>
 void wide_residues(Buffer& out, Buffer& work, size_t n, const Nat& a, const Nat& b, int workers,
                    const CrtWeights& crt_weights, const Nat* other = nullptr,
-                   Buffer* second = nullptr, bool columns_ready = false) {
+                   Buffer* second = nullptr, bool columns_ready = false, bool compact = false, size_t skip = 0) {
     constexpr U prime = moduli[I];
     using F = Field<prime>;
     const auto& weights = wide_weights<I>();
@@ -203,23 +220,24 @@ void wide_residues(Buffer& out, Buffer& work, size_t n, const Nat& a, const Nat&
     if constexpr (packed) {
         if (ntt::Layout(n).tiled) {
             F::template convolution<pair, true, triple>(out.data, work.data, extra, plan, workers,
-                                                        square, na, nb, nz, scale, unpack, columns_ready);
+                                                        square, na, nb, nz, scale, unpack, columns_ready, compact, skip);
             return;
         }
     }
     F::template convolution<pair, false, triple>(out.data, work.data, extra, plan, workers, square,
-                                                 na, nb, nz, scale, unpack, columns_ready);
+                                                 na, nb, nz, scale, unpack, columns_ready, compact, skip);
 }
 template <size_t width, size_t primes>
 Nat wide_recover(std::array<std::unique_ptr<Buffer>, primes>& residues, size_t n, size_t used,
-                 int workers, bool packed, size_t discard, size_t period) {
+                 int workers, bool packed, size_t discard, size_t period,
+                 bool prepared_columns = false, bool compact = false, bool* retry = nullptr) {
     constexpr size_t ndigits = primes * 2;
     constexpr auto& crt_weights = crt_tables[primes - 6];
     constexpr bool can_pack = ntt::have_packing && primes == 6;
     // Overlap the redundant CRT words locally before carrying through the output.
     constexpr size_t chunk = 256;
     Nat prefix;
-    auto reconstruct = [&](size_t first, size_t drop) {
+    auto reconstruct = [&]<bool decimal>(size_t first, size_t drop) {
         const size_t digits = width * (used - first);
         const size_t stride = width * chunk;
         // Keep the complete block containing the carry guard in scratch.
@@ -230,7 +248,7 @@ Nat wide_recover(std::array<std::unique_ptr<Buffer>, primes>& residues, size_t n
         Nat out = overwrite_limbs(digits - drop + 16);
         // Workers write the body. The final overlap is added into this tail.
         std::fill_n(out.end() - 16, 16, 0);
-        const ntt::Layout layout(n);
+        const ntt::Layout layout(n, prepared_columns);
         blocks(tails.size(), workers, [&](size_t block) {
             alignas(64) int64_t sums[chunk * width + 16]{};
             size_t start = first + block * chunk, count = std::min(chunk, used - start);
@@ -244,6 +262,9 @@ Nat wide_recover(std::array<std::unique_ptr<Buffer>, primes>& residues, size_t n
                         if constexpr (can_pack)
                             if (packed)
                                 return ntt::load_packed(residues[i]->data, pos);
+                        if constexpr (ntt::have_packing)
+                            if (compact)
+                                return ntt::load_packed(residues[i]->data + (pos & ~size_t(511)), pos & 511);
                         return _mm512_loadu_si512(residues[i]->data + pos);
                     }();
                     quotient = _mm512_fmadd_pd(_mm512_cvtepu64_pd(u),
@@ -254,34 +275,73 @@ Nat wide_recover(std::array<std::unique_ptr<Buffer>, primes>& residues, size_t n
                 // of the normalized residues recovers the quotient exactly.
                 auto q = _mm512_cvt_roundpd_epi64(quotient,
                                                   _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                __m512i upper{};
-                for (unsigned k = 0; k < ndigits; ++k) {
-                    __m512i low{}, high{};
-                    for (unsigned i = 0; i < primes; ++i) {
-                        auto weight = _mm512_set1_epi64(crt_weights.cofactors[i][k]);
-                        low = _mm512_madd52lo_epu64(low, source[i], weight);
-                        high = _mm512_madd52hi_epu64(high, source[i], weight);
+                if constexpr (decimal) {
+                    __m512i upper{};
+                    // For each weight w the high IFMA estimates floor(u*w/D)
+                    // from below, with error at most one since u < 2^52.
+                    // The sum of the redundant remainders is < 2*primes*D < 2^52.
+                    constexpr size_t chunks = (ndigits * 8 + 11) / 12;
+                    for (size_t k = 0; k < chunks; ++k) {
+                        __m512i low{}, next{};
+                        for (size_t i = 0; i < primes; ++i) {
+                            const auto& w = crt_weights.decimal[k][i];
+                            low = _mm512_madd52lo_epu64(low, source[i], _mm512_set1_epi64(w.value));
+                            next = _mm512_madd52hi_epu64(next, source[i], _mm512_set1_epi64(w.quotient));
+                        }
+                        auto rem = _mm512_madd52lo_epu64(low, next, _mm512_set1_epi64(R - crt_decimal))
+                                   & _mm512_set1_epi64(R - 1);
+                        auto v = upper + rem - _mm512_mullo_epi64(q, _mm512_set1_epi64(crt_weights.decimal_modulus[k]));
+                        upper = next;
+                        const size_t off = (k / 2) * 3 + (k % 2);
+                        auto deposit = [&](size_t d, __m512i x) {
+                            alignas(64) int64_t lanes[8];
+                            _mm512_store_si512(lanes, x);
+                            for (size_t l = 0; l < std::min<size_t>(8, count - j); ++l)
+                                sums[(j + l) * width + d] += lanes[l];
+                        };
+                        if (k % 2 == 0) {
+                            deposit(off, v);
+                        } else {
+                            // Split v*10000 across two base-10^8 positions.
+                            // The rounded quotient need not be exact: the signed
+                            // low part is computed from it by integer arithmetic.
+                            auto h = _mm512_cvt_roundpd_epi64(_mm512_cvtepi64_pd(v) * _mm512_set1_pd(0.0001),
+                                                      _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                            auto lo = v - _mm512_mullo_epi64(h, _mm512_set1_epi64(10000));
+                            deposit(off, _mm512_mullo_epi64(lo, _mm512_set1_epi64(10000)));
+                            deposit(off + 1, h);
+                        }
                     }
-                    // 2^52 = (2^52 / B)*B + (2^52 % B). Convert both
-                    // accumulators after all primes have contributed.
-                    // Each residue is below 2^51 and each weight below B,
-                    // so nine high halves sum to less than 4.5B and fit in 32 bits.
-                    auto v = low + upper +
-                        _mm512_mul_epu32(high, _mm512_set1_epi64(R % base)) -
-                        _mm512_mul_epu32(q, _mm512_set1_epi64(crt_weights.modulus[k]));
-                    upper = _mm512_mul_epu32(high, _mm512_set1_epi64(R / base));
-                    alignas(64) int64_t lanes[8];
-                    _mm512_store_si512(lanes, v);
-                    for (unsigned l = 0; l < std::min<size_t>(8, count - j); ++l)
-                        sums[(j + l) * width + k] += lanes[l];
+                } else {
+                    __m512i upper{};
+                    for (unsigned k = 0; k < ndigits; ++k) {
+                        __m512i low{}, high{};
+                        for (unsigned i = 0; i < primes; ++i) {
+                            auto weight = _mm512_set1_epi64(crt_weights.cofactors[i][k]);
+                            low = _mm512_madd52lo_epu64(low, source[i], weight);
+                            high = _mm512_madd52hi_epu64(high, source[i], weight);
+                        }
+                        // 2^52 = (2^52 / B)*B + (2^52 % B). Convert both
+                        // accumulators after all primes have contributed.
+                        // Each residue is below 2^51 and each weight below B,
+                        // so nine high halves sum to less than 4.5B and fit in 32 bits.
+                        auto v = low + upper +
+                            _mm512_mul_epu32(high, _mm512_set1_epi64(R % base)) -
+                            _mm512_mul_epu32(q, _mm512_set1_epi64(crt_weights.modulus[k]));
+                        upper = _mm512_mul_epu32(high, _mm512_set1_epi64(R / base));
+                        alignas(64) int64_t lanes[8];
+                        _mm512_store_si512(lanes, v);
+                        for (unsigned l = 0; l < std::min<size_t>(8, count - j); ++l)
+                            sums[(j + l) * width + k] += lanes[l];
+                    }
                 }
             }
             const size_t offset = (start - first) * width;
             auto* dest = offset < boundary ? prefix.data() + offset : out.data() + (offset - drop);
-            // The cofactor subtraction can leave a negative digit sum.
-            // At most four coefficients overlap, each subtracting less
-            // than 9*base. The first quotient is therefore >= -37, which
-            // keeps the biased remainder positive in CoefficientCarry.
+            // Cofactor subtraction can leave negative sums. Even with
+            // 12-digit weights, at most four overlapping coefficients
+            // subtract less than 9*10^12 each. After division by base
+            // this is well within CoefficientCarry's half-limb bias.
             if (count * width % 8 == 0) {
                 CoefficientCarry normalization;
                 for (size_t k = 0; k < count * width; k += 8) {
@@ -330,15 +390,26 @@ Nat wide_recover(std::array<std::unique_ptr<Buffer>, primes>& residues, size_t n
     const size_t guard = width + 4;
     size_t first = discard > guard ? (discard - guard) / (width * chunk) * chunk : 0;
     const size_t cut = discard - first * width;
-    auto out = reconstruct(first, cut);
+    auto recover_range = [&](size_t begin, size_t drop) {
+        if constexpr (primes >= 8) {
+            if (Team::use_decimal_crt())
+                return reconstruct.template operator()<true>(begin, drop);
+        }
+        return reconstruct.template operator()<false>(begin, drop);
+    };
+    auto out = recover_range(first, cut);
     if (first) {
         if (std::any_of(prefix.begin() + width + 2, prefix.begin() + cut,
                         [](uint32_t x) { return x != base - 1; })) {
             trim(out);
             return out;
         }
+        if (retry) {
+            *retry = true;
+            return {};
+        }
         Nat{}.swap(out);
-        out = reconstruct(0, 0);
+        out = recover_range(0, 0);
         trim(out);
         return discard_low(std::move(out), discard);
     }
@@ -420,7 +491,7 @@ bool linear_width_allowed(size_t width, size_t n) {
 }
 
 template <size_t width>
-Nat wide_product(const Nat& a, const Nat& b, int threads, size_t* requested, size_t discard) {
+Nat wide_product_pass(const Nat& a, const Nat& b, int threads, size_t* requested, size_t discard, bool& retry) {
     constexpr size_t primes = width + 1, ndigits = primes * 2;
     constexpr const auto& crt_weights = crt_tables[primes - 6];
     // With n <= 2^32, each coefficient is below 2^32 * base^(2*width).
@@ -447,7 +518,11 @@ Nat wide_product(const Nat& a, const Nat& b, int threads, size_t* requested, siz
     const size_t base_bytes = buffer_words * sizeof(U) * (primes + (&a != &b));
     const ntt::Layout layout(n);
     const bool square = &a == &b;
-    const bool tiled = n <= (U(1) << 32) && layout.tiled;
+    // Short transforms underfill the team when each field runs on its own.
+    // Prepare the columns together and split the row transforms across fields.
+    // The six-field plan has a separate packed-buffer layout.
+    const bool early_tiles = width != 5 && threads >= 8 && n >= (1u << 16) && !layout.tiled;
+    const bool tiled = n <= (U(1) << 32) && (layout.tiled || early_tiles);
     // For a large nonsquare, prepare one batch of the right operand at a
     // time. Nine primes fit in two passes with space for five temporaries.
     bool split = !square && n >= large_field_transform;
@@ -467,20 +542,28 @@ Nat wide_product(const Nat& a, const Nat& b, int threads, size_t* requested, siz
     std::array<std::unique_ptr<Buffer>, primes> residues;
     std::array<std::unique_ptr<Buffer>, primes> right;
     Buffer work(prepared || square ? 0 : buffer_words);
+    // For full products the packed tile pays on long, parallel eight-field
+    // transforms. Keep the usual narrow column stripes on high products.
+    const bool decimal = Team::use_decimal_crt();
+    const bool compact = decimal && width == 7 && ntt::have_packing && workers >= 16 &&
+                         n >= (size_t(1) << 21) && n <= (size_t(1) << 22) && !discard && !requested;
+    // Recover starts at a 256-coefficient block including the carry guard.
+    const size_t skip = decimal && !requested && layout.tiled && discard > width + 4
+        ? (discard - width - 4) / (width * 256) * 256 : 0;
     auto transform = [&]<size_t I>(int field_workers) {
         if (!prepared)
             residues[I] = std::make_unique<Buffer>(buffer_words);
         Buffer& second = right[I] ? *right[I] : work;
         wide_residues<I, can_pack, false, width>(*residues[I], second, n, a, b, field_workers,
-                                                 crt_weights, nullptr, nullptr, prepared);
+                                                 crt_weights, nullptr, nullptr, prepared, compact, skip);
         right[I].reset();
     };
     if (prepared)
         forward_columns<width, primes, can_pack, 0, primes>(a, residues, n, buffer_words, workers);
-    // A sibling series subtree may already be using the other cores.
-    // Split across fields only when the caller owns the entire team.
+    // Split short prepared plans across independent fields within the subteam.
+    // Larger plans split fields only when the caller owns the whole team.
     const bool parallel_fields = prepared && threads >= 8 && n <= parallel_field_limit &&
-                                 size_t(threads) == Team::active()->size();
+                                 (early_tiles || size_t(threads) == Team::active()->size());
     field_batches<primes>(prepared && split, five_fields, [&]<size_t first, size_t count>() {
         if (prepared && !square)
             forward_columns<width, primes, can_pack, first, count>(b, right, n, buffer_words, workers);
@@ -489,7 +572,19 @@ Nat wide_product(const Nat& a, const Nat& b, int threads, size_t* requested, siz
     work.release();
     if (requested)
         *requested = period;
-    return wide_recover<width>(residues, n, used, workers, packed, discard, period);
+    return wide_recover<width>(residues, n, used, workers, packed, discard, period, prepared, compact, skip >= layout.cols ? &retry : nullptr);
+}
+template <size_t width>
+Nat wide_product(const Nat& a, const Nat& b, int threads, size_t* requested, size_t discard) {
+    bool retry = false;
+    Nat out = wide_product_pass<width>(a, b, threads, requested, discard, retry);
+    if (retry) {
+        // The discarded region can propagate into the answer. All workspace
+        // from the first pass has been released before repeating the product.
+        out = wide_product_pass<width>(a, b, threads, nullptr, 0, retry);
+        return discard_low(std::move(out), discard);
+    }
+    return out;
 }
 template <size_t width>
 bool wide_pair(const Nat& common, const Nat& a, const Nat& b, Nat& x, Nat& y, int threads,

@@ -51,11 +51,12 @@ struct LeafSum {
     LeafInt p, q, t;
     size_t shift;
 };
+template <bool prefix_supplies_p = false>
 inline void leaf_term_scaled(LeafSum& out, uint64_t k, __uint128_t numerator, uint64_t denominator,
                              uint64_t correction) {
     using W = __uint128_t;
     if (!k) {
-        out.p.set(1);
+        out.p.set(prefix_supplies_p ? numerator : 1);
         out.q.set(1);
         out.t.set(13591409);
         out.shift = 0;
@@ -63,7 +64,8 @@ inline void leaf_term_scaled(LeafSum& out, uint64_t k, __uint128_t numerator, ui
     }
     constexpr uint64_t decimal[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000};
     out.p.set(numerator);
-    LeafInt linear;
+    LeafInt scratch;
+    LeafInt& linear = prefix_supplies_p ? out.t : scratch;
     const W linear_weight = W(13591409 + 545140134 * k) * correction;
     W scaled_weight;
     auto scale = decimal[(8 - 3 * k % 8) % 8];
@@ -75,7 +77,8 @@ inline void leaf_term_scaled(LeafSum& out, uint64_t k, __uint128_t numerator, ui
         b.set(scale);
         leaf_product(linear, a, b);
     }
-    leaf_product(out.t, out.p, linear);
+    if constexpr (!prefix_supplies_p)
+        leaf_product(out.t, out.p, linear);
     W cube = W(denominator) * denominator * denominator;
     constexpr uint64_t c = 10939058860032ULL;
     if (cube <= ~W(0) / c)

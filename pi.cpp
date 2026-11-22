@@ -687,6 +687,16 @@ Options parse_options(int argc, char** argv) {
     }
     return options;
 }
+CrtSchedule schedule_for_precision(U digits) {
+    // Use the nearest measured precision at each schedule crossover.
+    if (digits <= 1'500'000'000ULL)
+        return CrtSchedule::decimal;
+    if (digits <= 2'500'000'000ULL)
+        return CrtSchedule::standard;
+    if (digits <= 4'500'000'000ULL)
+        return CrtSchedule::decimal;
+    return CrtSchedule::standard;
+}
 void print_benchmark(std::string_view result, double seconds) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
     if (!SHA256(reinterpret_cast<const unsigned char*>(result.data()), result.size(), digest))
@@ -716,7 +726,7 @@ int main(int argc, char** argv) {
             throw std::length_error("decimal output alone exceeds available memory");
         if (available != SIZE_MAX && digits <= available / 16 && !std::getenv("PI_TRANSFORM_MIB"))
             reserve_buffer_arena(std::min<size_t>(12 * digits, available / 4));
-        Team team(options.threads);
+        Team team(options.threads, schedule_for_precision(digits));
         DecimalText storage;
         std::string_view result = "3";
         if (digits) {
